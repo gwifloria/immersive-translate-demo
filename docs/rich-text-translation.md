@@ -250,6 +250,210 @@ function Hs(text, minTextCount, minWordCount) {
                       不翻译
 ```
 
+---
+
+# 段落聚合机制
+
+## 核心概念
+
+沉浸式翻译的文本长度判断**不是在单个节点级别**进行的，而是在**段落级别**进行。这意味着多个相邻的 inline 元素会被聚合成一个"段落"，然后对聚合后的文本进行长度判断。
+
+**这就是为什么 "Archive"（7字符）在沉浸式翻译中会被翻译，而在逐节点判断的插件中不会被翻译。**
+
+## 段落构建流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DOM 遍历                                 │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │ 遇到块级元素 (div/p)   │
+              │ → 创建新的"段落"容器   │
+              └───────────┬───────────┘
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │ 遍历子节点             │
+              └───────────┬───────────┘
+                          │
+            ┌─────────────┴─────────────┐
+            │                           │
+            ▼                           ▼
+   ┌─────────────────┐         ┌─────────────────┐
+   │ 是 inlineTag?   │         │ 是块级元素?      │
+   │ (A, SPAN, etc.) │         │ (DIV, P, etc.)  │
+   └────────┬────────┘         └────────┬────────┘
+            │ 是                        │ 是
+            ▼                           ▼
+   ┌─────────────────┐         ┌─────────────────┐
+   │ 聚合到当前段落   │         │ 结束当前段落     │
+   │ paragraph.nodes │         │ 创建新段落       │
+   │ .push(node)     │         │                 │
+   └─────────────────┘         └─────────────────┘
+```
+
+## 聚合判断 vs 单节点判断
+
+### ❌ 错误方式：逐节点判断
+
+```javascript
+// 逐节点判断 - "Archive" 不会被翻译
+function walkNodes(container) {
+    for (let node of container.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            let text = node.textContent.trim();
+            // 单独判断每个节点
+            if (text.length >= MIN_TEXT_LENGTH) {  // MIN_TEXT_LENGTH = 10
+                translateNode(node);  // "Archive"(7) < 10, 跳过
+            }
+        }
+    }
+}
+```
+
+### ✅ 正确方式：段落聚合判断
+
+```javascript
+// 段落聚合判断 - "Archive" 会被翻译
+function buildParagraph(container) {
+    let paragraph = {
+        nodes: [],           // 收集所有相关节点
+        text: "",            // 聚合后的文本
+        commonAncestor: null // 共同祖先
+    };
+
+    for (let node of container.childNodes) {
+        if (isInlineElement(node)) {
+            // 将 inline 元素聚合到段落中
+            paragraph.nodes.push(node);
+            paragraph.text += " " + node.textContent;
+        } else if (isBlockElement(node)) {
+            // 遇到块级元素，结束当前段落
+            if (shouldTranslateParagraph(paragraph)) {
+                translateParagraph(paragraph);
+            }
+            // 递归处理块级元素
+            buildParagraph(node);
+            // 创建新段落
+            paragraph = { nodes: [], text: "", commonAncestor: null };
+        }
+    }
+
+    // 处理最后一个段落
+    if (shouldTranslateParagraph(paragraph)) {
+        translateParagraph(paragraph);
+    }
+}
+
+function shouldTranslateParagraph(paragraph) {
+    let text = paragraph.text.trim();
+    let charCount = text.length;
+    let wordCount = text.split(/\s+/).length;
+
+    // 对聚合后的文本进行判断
+    return charCount >= blockMinTextCount || wordCount >= blockMinWordCount;
+}
+```
+
+## 实际案例分析
+
+### HTML 结构
+
+```html
+<ul>
+  <li><a>Archive</a></li>
+  <li><a>By email</a></li>
+  <li><a>More featured articles</a></li>
+  <li><a>About</a></li>
+</ul>
+```
+
+### 逐节点判断结果
+
+| 节点 | 文本 | 字符数 | >= 10? | 结果 |
+|------|------|--------|--------|------|
+| `<a>` | "Archive" | 7 | ❌ | 不翻译 |
+| `<a>` | "By email" | 8 | ❌ | 不翻译 |
+| `<a>` | "More featured articles" | 21 | ✅ | 翻译 |
+| `<a>` | "About" | 5 | ❌ | 不翻译 |
+
+### 段落聚合判断结果
+
+**关键：如何定义"段落"边界**
+
+沉浸式翻译中，每个 `<li>` 是一个独立的段落（因为 `LI` 不在 `inlineTags` 中）：
+
+| 段落 | 聚合文本 | 字符数 | 单词数 | >= 24 chars 或 >= 4 words? |
+|------|----------|--------|--------|---------------------------|
+| `<li>1` | "Archive" | 7 | 1 | ❌ |
+| `<li>2` | "By email" | 8 | 2 | ❌ |
+| `<li>3` | "More featured articles" | 21 | 3 | ❌ |
+| `<li>4` | "About" | 5 | 1 | ❌ |
+
+**等等，这样 "Archive" 还是不会被翻译？**
+
+### 真正的机制：容器级别的聚合
+
+实际上，沉浸式翻译还有一层机制：**当父容器设置了特定选择器时，整个区域会作为一个翻译单元**。
+
+```javascript
+// 如果使用 atomicBlockSelectors 或 selectors 配置
+{
+  "selectors": [".hlist"],        // 强制翻译这个区域
+  "atomicBlockSelectors": [".hlist"]  // 或作为原子块处理
+}
+```
+
+当 `.hlist` 被配置为原子块时：
+
+| 原子块 | 聚合文本 | 字符数 | 单词数 |
+|--------|----------|--------|--------|
+| `.hlist` | "Archive By email More featured articles About" | 42 | 7 |
+
+**42 >= 24 ✅**，所以整个区域都会被翻译，包括 "Archive"。
+
+## 关键配置
+
+### 1. 强制翻译某个区域
+
+```json
+{
+  "selectors": [".your-selector"]
+}
+```
+
+### 2. 将区域作为原子块
+
+```json
+{
+  "atomicBlockSelectors": [".your-selector"]
+}
+```
+
+### 3. 将元素视为内联
+
+```json
+{
+  "additionalInlineSelectors": ["li", ".hlist li"]
+}
+```
+
+当 `li` 被视为 inline 元素时，多个 `<li>` 的文本会聚合在一起判断。
+
+## 总结
+
+| 判断方式 | 适用场景 | "Archive" 是否被翻译 |
+|----------|----------|---------------------|
+| 逐节点判断 | 简单实现 | ❌ 不翻译（7 < 阈值） |
+| 段落聚合（LI 为块级） | 沉浸式翻译默认 | ❌ 不翻译 |
+| 段落聚合（LI 为内联） | 配置 additionalInlineSelectors | ✅ 翻译 |
+| 原子块聚合 | 配置 atomicBlockSelectors | ✅ 翻译 |
+| 强制选择器 | 配置 selectors | ✅ 翻译 |
+
+---
+
 ## 问题案例：Wikipedia 列表内容
 
 ### 问题 HTML
