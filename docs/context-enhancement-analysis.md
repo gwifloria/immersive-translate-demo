@@ -807,3 +807,661 @@ function a4(element, config) {
 2. **CSS 计算缓存**：`getComputedStyle` 结果会被缓存到元素上
 3. **批量处理**：相邻的内联元素会合并为一个翻译单元
 4. **提前退出**：遇到排除标签时直接跳过子树遍历
+
+---
+
+# 翻译风格（AI 专家）实现分析
+
+## 概述
+
+翻译风格（也称为 AI 专家/AI 助手）是沉浸式翻译的高级功能，允许用户选择不同领域的专业翻译风格，如技术文档、学术论文、新闻等。每个翻译风格都有专门优化的 prompt 模板和术语配置。
+
+## 预定义翻译风格
+
+### 可用的风格 ID
+
+```javascript
+aiAssistantIds: [
+  "paraphrase",              // 意译模式
+  "plain-english",           // 简明英语
+  "paragraph-summarizer-expert", // 段落摘要专家
+  "twitter",                 // Twitter
+  "tech",                    // 技术文档
+  "reddit",                  // Reddit
+  "paper",                   // 学术论文
+  "news",                    // 新闻
+  "music",                   // 音乐
+  "medical",                 // 医学
+  "legal",                   // 法律
+  "github",                  // GitHub
+  "game",                    // 游戏
+  "ecommerce",               // 电商
+  "financial",               // 金融
+  "fiction",                 // 小说
+  "ao3",                     // AO3 同人小说
+  "ebook",                   // 电子书
+  "design",                  // 设计
+  "web3",                    // Web3
+  "bilingual-mix"            // 双语混排
+]
+```
+
+## 架构设计
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    AI 助手（翻译风格）系统                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────┐  ┌─────────────────────┐              │
+│  │  预定义 AI 助手      │  │  用户自定义助手      │              │
+│  │  (远程加载)          │  │  (customAiAssistants)│              │
+│  └──────────┬──────────┘  └──────────┬──────────┘              │
+│             │                        │                          │
+│             └────────────┬───────────┘                          │
+│                          ▼                                      │
+│              ┌─────────────────────┐                            │
+│              │   助手匹配引擎       │                            │
+│              │   xh() 函数         │                            │
+│              └──────────┬──────────┘                            │
+│                         │                                       │
+│                         ▼                                       │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │                    匹配条件                               │  │
+│  │  - URL 匹配 (matches / excludeMatches)                   │  │
+│  │  - 语言对匹配 (languageMatches)                          │  │
+│  │  - 翻译服务匹配 (translationService)                     │  │
+│  │  - 手动选择 (assistantId)                                │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                         │                                       │
+│                         ▼                                       │
+│              ┌─────────────────────┐                            │
+│              │   配置合并引擎       │                            │
+│              │   hx() / gx()       │                            │
+│              └──────────┬──────────┘                            │
+│                         │                                       │
+│                         ▼                                       │
+│              ┌─────────────────────┐                            │
+│              │  最终翻译服务配置    │                            │
+│              │  (含 prompt/terms)  │                            │
+│              └─────────────────────┘                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## AI 助手数据结构
+
+### 助手配置对象
+
+```typescript
+interface AiAssistant {
+  id: string;                    // 唯一标识符
+  name?: string;                 // 显示名称
+  extensionVersion: string;      // 最低支持版本
+  version?: string;              // 助手版本
+  priority?: number;             // 优先级（数值越小越优先）
+
+  // 匹配规则
+  matches?: string[];            // URL 匹配模式
+  excludeMatches?: string[];     // URL 排除模式
+  languageMatches?: string[];    // 语言对匹配，如 "en2zh-CN"
+
+  // Prompt 配置
+  systemPrompt?: string;         // 系统提示词
+  prompt?: string;               // 用户提示词
+  multiplePrompt?: string;       // 多段翻译提示词
+  multipleSystemPrompt?: string; // 多段翻译系统提示词
+  subtitlePrompt?: string;       // 字幕翻译提示词
+
+  // 环境变量
+  env?: {
+    title_prompt?: string;
+    summary_prompt?: string;
+    terms_prompt?: string;
+    // ... 其他变量
+  };
+
+  // 术语配置
+  terms?: Record<string, string>; // 助手专属术语表
+
+  // 语言覆盖
+  langOverrides?: LangOverride[];
+
+  // 性能配置
+  temperature?: number;
+  maxTextGroupLengthPerRequest?: number;
+  maxTextLengthPerRequest?: number;
+}
+```
+
+### 翻译服务中的助手配置
+
+```json
+{
+  "translationServices": {
+    "openai": {
+      "assistantId": "common",        // 默认使用通用助手
+      "fallbackAssistantId": "common" // 自动匹配失败时的回退
+    },
+    "claude": {
+      "assistantId": "auto",          // 自动匹配
+      "fallbackAssistantId": "paper"  // 回退到学术论文风格
+    }
+  }
+}
+```
+
+## 核心实现
+
+### 1. 助手匹配 - `xh()` 函数
+
+```javascript
+function xh(context, assistants, assistantId, currentAssistant) {
+    // 如果当前助手已匹配当前翻译服务，直接返回
+    if (currentAssistant?.applyTranslationService === context.translationService) {
+        return currentAssistant;
+    }
+
+    let { url } = context;
+    let matched = null;
+
+    // 如果是 "common" 或空，不匹配任何助手
+    if (assistantId === "common" || !assistantId) {
+        return null;
+    }
+
+    try {
+        // 1. 如果指定了具体 ID，直接查找
+        if (assistantId) {
+            matched = assistants.find(a => a.id === assistantId);
+            if (matched) return matched;
+        }
+
+        // 2. 自动匹配：根据 URL 和语言对
+        matched = assistants
+            .filter(a => {
+                // URL 匹配
+                return Ve(url, a.matches) && !Ve(url, a.excludeMatches);
+            })
+            .filter(a => {
+                // 语言对匹配
+                if (!a.languageMatches) return true;
+                return a.languageMatches.some(langMatch => {
+                    let [source, target] = langMatch.split("2");
+                    return ["auto", context.sourceLanguage].includes(source) &&
+                           ["auto", context.targetLanguage].includes(target);
+                });
+            })?.[0];
+
+        return matched;
+    } catch (error) {
+        console.error(error);
+        return null;
+    }
+}
+```
+
+### 2. 配置合并 - `hx()` 函数
+
+```javascript
+async function hx(serviceConfig, defaultConfig, context, assistants, currentAssistant) {
+    let config = { ...defaultConfig };
+
+    // 1. 查找匹配的 AI 助手
+    let assistant = xh(context, assistants, serviceConfig.assistantId, currentAssistant);
+
+    // 2. 如果自动匹配失败，尝试回退助手
+    if (!assistant && defaultConfig.fallbackAssistantId &&
+        defaultConfig.fallbackAssistantId !== "common" &&
+        defaultConfig.assistantId === "auto") {
+        assistant = assistants?.find(a => a.id === defaultConfig.fallbackAssistantId);
+    }
+
+    // 3. 合并助手配置
+    if (assistant) {
+        px(assistant);  // 处理差异配置
+        let env = { ...config.env || {}, ...assistant.env || {} };
+        Object.assign(config, gx({ ...assistant, env }));
+    }
+
+    // 4. 收集页面上下文
+    if (config.env && globalThis?.location &&
+        !G7(globalThis.location.href, context.withAITitleBlockUrls)) {
+        config.env.imt_domain = globalThis.location.hostname || "";
+        config.env.imt_title = globalThis.document.originTitle ||
+                               globalThis.document.title || "";
+    }
+
+    // 5. 应用语言覆盖配置
+    config = mx(config, config.langOverrides, context);
+
+    // 6. 处理术语表
+    if (u0(defaultConfig, assistant)) {
+        let terms = await H4();  // 获取上下文术语
+        config.contextTerms = terms;
+    }
+
+    return config;
+}
+```
+
+### 3. 配置提取 - `gx()` 函数
+
+```javascript
+function gx(assistant) {
+    let config = {
+        env: assistant?.env,
+        prompt: assistant?.prompt,
+        systemPrompt: assistant?.systemPrompt,
+        multipleSystemPrompt: assistant?.multipleSystemPrompt,
+        multiplePrompt: assistant?.multiplePrompt,
+        subtitlePrompt: assistant?.subtitlePrompt,
+        langOverrides: assistant?.langOverrides,
+        temperature: assistant?.temperature,
+        maxTextGroupLengthPerRequest: assistant?.maxTextGroupLengthPerRequest,
+        maxTextLengthPerRequest: assistant?.maxTextLengthPerRequest,
+        maxTokensRatio: assistant?.maxTokensRatio,
+        minTokensRatio: assistant?.minTokensRatio,
+        maxTextGroupLengthPerRequestForSubtitle:
+            assistant?.maxTextGroupLengthPerRequestForSubtitle
+    };
+
+    // 移除空值
+    for (let key in config) {
+        if (config[key] == null) delete config[key];
+    }
+
+    return config;
+}
+```
+
+## 助手加载机制
+
+### 远程加载
+
+```javascript
+// 从远程服务器加载助手配置
+async function W_(assistantIds, localConfig) {
+    let results = await Promise.allSettled(
+        assistantIds.map(id =>
+            De({ url: `${BASE_AI_URL}api/plugins/${id}.json` })
+        )
+    );
+
+    results.forEach(result => {
+        if (result.status === "fulfilled") {
+            let assistant = result.value;
+            if (assistant) {
+                Wd("add", assistant, localConfig);  // 添加到本地配置
+            }
+        }
+    });
+}
+```
+
+### 版本检查
+
+```javascript
+// 检查助手版本是否兼容
+function dx(assistant) {
+    return Kn(Aa(), assistant.extensionVersion);  // 比较扩展版本
+}
+
+// 检查是否需要更新
+function Q_(assistant, remoteVersion) {
+    if (!remoteVersion) return false;
+    return Kn(assistant.version, remoteVersion);  // 版本过旧需要更新
+}
+```
+
+## 用户自定义助手
+
+### 配置结构
+
+```json
+{
+  "customAiAssistants": [
+    {
+      "id": "custom-tech-cn",
+      "name": "技术文档中文优化",
+      "extensionVersion": "1.0.0",
+      "matches": ["*.github.com/*", "*.stackoverflow.com/*"],
+      "systemPrompt": "你是一位专业的技术文档翻译专家...",
+      "terms": {
+        "API": "API",
+        "SDK": "SDK",
+        "framework": "框架"
+      }
+    }
+  ]
+}
+```
+
+### 助手管理
+
+```javascript
+// 添加或编辑助手
+async function Wd(action, assistant, localConfig) {
+    localConfig = localConfig || await An();
+    let assistants = localConfig.aiAssistants || [];
+    let updated = false;
+
+    if (action === "edit" && dx(assistant)) {
+        // 编辑现有助手
+        for (let i = assistants.length - 1; i >= 0; i--) {
+            if (assistants[i].id === assistant.id) {
+                assistants[i] = assistant;
+                updated = true;
+            }
+        }
+    } else if (action === "add" && dx(assistant)) {
+        // 添加新助手（先删除同 ID 的旧版本）
+        for (let i = assistants.length - 1; i >= 0; i--) {
+            if (assistants[i].id === assistant.id) {
+                assistants.splice(i, 1);
+            }
+        }
+        assistants.push(assistant);
+        updated = true;
+    } else {
+        // 删除助手
+        for (let i = assistants.length - 1; i >= 0; i--) {
+            if (assistants[i].id === assistant.id) {
+                assistants.splice(i, 1);
+            }
+        }
+        updated = true;
+    }
+
+    // 按优先级排序并保存
+    localConfig.aiAssistants = assistants.sort((a, b) => a.priority - b.priority);
+
+    // 更新助手 ID 列表
+    let syncConfig = await Gt();
+    syncConfig.aiAssistantIds = [...new Set(assistants.map(a => a.id))];
+
+    await ai(localConfig);
+    await Fn(syncConfig);
+
+    return updated;
+}
+```
+
+---
+
+# AI 术语库实现分析
+
+## 概述
+
+AI 术语库是确保翻译一致性的重要功能，允许用户定义特定术语的翻译方式。术语库支持：
+- 全局术语表（应用于所有翻译）
+- AI 助手专属术语（随助手配置加载）
+- 领域标记术语（仅在特定领域生效）
+
+## 术语库数据结构
+
+### 基础术语格式
+
+```typescript
+interface GlossaryItem {
+  k: string;    // 源词（key）
+  v: string;    // 译词（value），空字符串表示保留原文
+  domain?: string;  // 领域标记（可选）
+}
+```
+
+### 配置示例
+
+```json
+{
+  "generalRule": {
+    "glossaries": [
+      { "k": "LLM", "v": "" },           // 保留原文
+      { "k": "API", "v": "API" },         // 保留原文
+      { "k": "machine learning", "v": "机器学习" },
+      { "k": "kick[Football]", "v": "踢球" }  // 领域特定
+    ]
+  }
+}
+```
+
+## 术语优先级体系
+
+```
+最高优先级
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  1. AI 助手专属术语 (assistant.terms)   │
+│  随翻译风格加载，领域针对性最强         │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  2. 用户自定义术语 (glossaries)         │
+│  用户在设置中手动添加的术语             │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  3. 精确域匹配术语                      │
+│  带 [domain] 标记且匹配当前页面         │
+└─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│  4. 无域标记术语（绝对优先）            │
+│  在所有页面都强制应用                   │
+└─────────────────────────────────────────┘
+
+最低优先级
+```
+
+## 核心实现
+
+### 1. 术语合并
+
+```javascript
+async function handleGlossaries(sourceLanguage, env, text, glossaries, assistant) {
+    // 1. 合并 AI 助手的术语
+    if (assistant?.terms) {
+        Object.keys(assistant.terms).forEach(key => {
+            if (assistant.terms[key]) {
+                glossaries.push({
+                    k: key,
+                    v: assistant.terms[key]
+                });
+            }
+        });
+    }
+
+    // 2. 获取文本中实际出现的术语
+    let validGlossaries = this.getValidGlossaries(sourceLanguage, text, glossaries);
+
+    if (validGlossaries.length) {
+        let hasWithDomain = false;   // 是否有带域标记的术语
+        let hasWithoutDomain = false; // 是否有不带域标记的术语
+
+        // 3. 格式化术语为 'source': 'target' 格式
+        env.imt_terms = validGlossaries.map(item => {
+            let domain = item.domain || "";
+            if (domain) {
+                domain = `[${domain}]`;
+                hasWithDomain = true;
+            } else {
+                hasWithoutDomain = true;
+            }
+            // 转义反引号
+            return `'${item.k.replace(/`/g, "\\`")}${domain}': '${(item.v || item.k).replace(/`/g, "\\`")}'`;
+        }).join(", ");
+
+        // 4. 控制是否显示特定类型的术语提示
+        env.imt_terms_with_domain = hasWithDomain ? env.imt_terms_with_domain : "";
+        env.imt_terms_without_domain = hasWithoutDomain ? env.imt_terms_without_domain : "";
+    }
+}
+```
+
+### 2. 术语匹配算法
+
+```javascript
+getValidGlossaries(sourceLanguage, text, glossaries) {
+    if (!glossaries || glossaries.length === 0) return [];
+
+    // 1. 提取术语关键词并按长度排序（优先匹配长词）
+    let keywords = glossaries
+        .map(item => extractKeyword(item.k))
+        .sort((a, b) => b.length - a.length);
+
+    if (keywords.length === 0) return [];
+
+    // 2. 根据语言类型构建正则表达式
+    let regex;
+    if (isCJK(sourceLanguage) || sourceLanguage === "auto") {
+        // CJK 语言不需要单词边界
+        regex = new RegExp(`(${keywords.join("|")})`, "gi");
+    } else {
+        // 非 CJK 语言需要单词边界
+        regex = new RegExp(`\\b(${keywords.join("|")})\\b`, "gi");
+    }
+
+    // 3. 从文本中提取匹配的术语
+    let matched = extractMatches(text, glossaries, regex);
+
+    // 4. 去重
+    matched = deduplicate(matched);
+
+    // 5. 更新全局术语缓存
+    updateTermsCache(existing => deduplicate([...existing, ...matched]));
+
+    return matched;
+}
+```
+
+### 3. 关键词提取
+
+```javascript
+function extractKeyword(term) {
+    // 移除领域标记，如 "kick[Football]" → "kick"
+    return term.replace(/\[.*?\]$/, "").trim();
+}
+```
+
+### 4. 术语在 Prompt 中的应用
+
+```
+Required Terminology: You MUST use the following terms during translation.
+If 'source':'target', source == target, keep the source term unchanged.
+
+Terms ->
+
+'API': 'API', 'machine learning[AI]': '机器学习', 'kick[Football]': '踢球'
+```
+
+## 领域标记详解
+
+### 标记格式
+
+```
+源词[领域]
+```
+
+### 使用场景
+
+| 术语 | 含义 | 应用范围 |
+|------|------|----------|
+| `API` | 无领域标记 | 所有页面，强制应用 |
+| `kick[Football]` | 足球领域 | 仅在足球相关页面生效 |
+| `token[AI]` | AI 领域 | 仅在 AI 相关页面生效 |
+| `cell[Biology]` | 生物学领域 | 仅在生物学相关页面生效 |
+
+### 领域匹配逻辑
+
+```javascript
+function shouldApplyTerm(term, currentDomain) {
+    let domain = extractDomain(term.k);
+
+    if (!domain) {
+        // 无领域标记，始终应用
+        return true;
+    }
+
+    // 检查当前页面是否匹配该领域
+    return currentDomain === domain;
+}
+```
+
+## 术语同步机制
+
+### 本地存储
+
+```javascript
+// 术语表存储在 generalRule.glossaries
+{
+  "generalRule": {
+    "glossaries": [...]
+  }
+}
+```
+
+### 同步到云端
+
+```javascript
+// 独立同步的键
+const independentSyncKeys = [
+  "generalRule.glossaries",  // 术语表
+  "generalRule.injectedCss",
+  "aiAssistantsMatches",
+  "customAiAssistants"
+];
+```
+
+## 性能优化
+
+1. **长词优先**：术语按长度降序排列，避免短词误匹配长词的一部分
+2. **正则预编译**：正则表达式编译后可复用
+3. **增量更新**：只添加新出现的术语到缓存
+4. **延迟加载**：AI 助手术语在需要时才加载
+5. **去重处理**：避免重复术语影响翻译质量
+
+## 最佳实践
+
+### 术语表配置建议
+
+```json
+{
+  "glossaries": [
+    // 1. 通用技术术语（保留原文）
+    { "k": "API", "v": "" },
+    { "k": "SDK", "v": "" },
+    { "k": "UI", "v": "" },
+
+    // 2. 需要翻译的术语
+    { "k": "machine learning", "v": "机器学习" },
+    { "k": "deep learning", "v": "深度学习" },
+
+    // 3. 领域特定术语
+    { "k": "cell[Biology]", "v": "细胞" },
+    { "k": "cell[Excel]", "v": "单元格" },
+
+    // 4. 品牌/专有名词
+    { "k": "Anthropic", "v": "" },
+    { "k": "Claude", "v": "" }
+  ]
+}
+```
+
+### 自定义 AI 助手术语
+
+```json
+{
+  "customAiAssistants": [{
+    "id": "my-tech-style",
+    "terms": {
+      "repository": "仓库",
+      "pull request": "拉取请求",
+      "merge": "合并",
+      "branch": "分支"
+    }
+  }]
+}
+```
